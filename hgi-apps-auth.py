@@ -6,19 +6,19 @@ Unified Login and LDAP Auth App
 - Issues a secure session token (stored in-memory)
 - Protects endpoints, redirects to login if not authenticated
 """
-import sys, os, ldap, uuid, signal
+import sys, os, ldap, uuid, signal, base64
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from http.cookies import SimpleCookie
 from urllib.parse import urlparse, parse_qs
 import threading
 
 
-# In-memory session store: {token: (username, created_time)}
+# In-memory session store: {uid_uuid_token: (username, created_time)}
 import time
 import argparse
 SESSIONS = {}
 SESSIONS_LOCK = threading.Lock()  # Protect session dict from concurrent access
-SESSION_COOKIE = 'sessionid'
+SESSION_COOKIE = 'nginxauth'
 SESSION_LIFETIME = 43200  # 12 hours in seconds
 
 
@@ -201,13 +201,15 @@ class UnifiedHandler(BaseHTTPRequestHandler):
             return self.serve_login_form(error='Missing username or password', target=target)
         if not self.ldap_auth(username, password):
             return self.serve_login_form(error='Invalid credentials', target=target)
-        # Success: create session
-        token = str(uuid.uuid4())
+        # Success: create session with uid:uuid format
+        uid_uuid_token = f"{username}:{uuid.uuid4()}"
+        # Base64 encode the token for cookie storage
+        encoded_token = base64.b64encode(uid_uuid_token.encode()).decode()
         now = int(time.time())
         with SESSIONS_LOCK:
-            SESSIONS[token] = (username, now)
+            SESSIONS[uid_uuid_token] = (username, now)
         self.send_response(302)
-        self.send_header('Set-Cookie', f'{SESSION_COOKIE}={token}; HttpOnly; Path=/')
+        self.send_header('Set-Cookie', f'{SESSION_COOKIE}={encoded_token}; HttpOnly; Path=/')
         self.send_header('Location', target)
         self.end_headers()
 
@@ -261,18 +263,34 @@ class UnifiedHandler(BaseHTTPRequestHandler):
         if not cookie:
             return False
         c = SimpleCookie(cookie)
-        token = c.get(SESSION_COOKIE)
-        if not token:
+        encoded_token = c.get(SESSION_COOKIE)
+        if not encoded_token:
             return False
+        
+        try:
+            # Decode the base64 token
+            uid_uuid_token = base64.b64decode(encoded_token.value).decode()
+            # Verify format is uid:uuid
+            if ':' not in uid_uuid_token:
+                return False
+            uid, token_uuid = uid_uuid_token.split(':', 1)
+            if not uid or not token_uuid:
+                return False
+        except Exception:
+            return False
+            
         with SESSIONS_LOCK:
-            value = SESSIONS.get(token.value)
+            value = SESSIONS.get(uid_uuid_token)
             if not value:
                 return False
             username, created = value
+            # Verify the uid matches the stored username
+            if uid != username:
+                return False
             now = int(time.time())
             if now - created > SESSION_LIFETIME:
                 # Session expired, remove it
-                del SESSIONS[token.value]
+                del SESSIONS[uid_uuid_token]
                 return False
         return True
 
@@ -281,18 +299,34 @@ class UnifiedHandler(BaseHTTPRequestHandler):
         if not cookie:
             return ''
         c = SimpleCookie(cookie)
-        token = c.get(SESSION_COOKIE)
-        if not token:
+        encoded_token = c.get(SESSION_COOKIE)
+        if not encoded_token:
             return ''
+        
+        try:
+            # Decode the base64 token
+            uid_uuid_token = base64.b64decode(encoded_token.value).decode()
+            # Verify format is uid:uuid
+            if ':' not in uid_uuid_token:
+                return ''
+            uid, token_uuid = uid_uuid_token.split(':', 1)
+            if not uid or not token_uuid:
+                return ''
+        except Exception:
+            return ''
+            
         with SESSIONS_LOCK:
-            value = SESSIONS.get(token.value)
+            value = SESSIONS.get(uid_uuid_token)
             if not value:
                 return ''
             username, created = value
+            # Verify the uid matches the stored username
+            if uid != username:
+                return ''
             now = int(time.time())
             if now - created > SESSION_LIFETIME:
                 # Session expired, remove it
-                del SESSIONS[token.value]
+                del SESSIONS[uid_uuid_token]
                 return ''
         return username
 
@@ -353,9 +387,9 @@ if __name__ == '__main__':
     # Session options
     parser.add_argument('--session-lifetime', type=int, default=43200,
                         help='Session lifetime in seconds (Default: 43200 = 12 hours)')
-    parser.add_argument('--session-cookie-name', default='sessionid',
-                        help='Session cookie name (Default: sessionid)')
-    
+    parser.add_argument('--session-cookie-name', default='nginxauth',
+                        help='Session cookie name (Default: nginxauth)')
+
     args = parser.parse_args()
     
     # Set global configuration
